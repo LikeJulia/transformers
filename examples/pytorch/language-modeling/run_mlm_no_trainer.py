@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+#!/usr/bin/env python
 # coding=utf-8
 # Copyright 2021 The HuggingFace Inc. team. All rights reserved.
 #
@@ -53,7 +54,7 @@ from transformers import (
 )
 from transformers.file_utils import get_full_repo_name
 from transformers.utils.versions import require_version
-
+from utils import DAMWrapper
 
 logger = logging.getLogger(__name__)
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
@@ -61,6 +62,33 @@ MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 
+
+def get_module_by_name(model, module_name):
+    """
+    Get a module specified by its module name
+    Parameters
+    ----------
+    model : pytorch model
+        the pytorch model from which to get its module
+    module_name : str
+        the name of the required module
+    Returns
+    -------
+    module, module
+        the parent module of the required module, the required module
+    """
+    name_list = module_name.split(".")
+    for name in name_list[:-1]:
+        if hasattr(model, name):
+            model = getattr(model, name)
+        else:
+            return None, None
+    if hasattr(model, name_list[-1]):
+        leaf_module = getattr(model, name_list[-1])
+        return model, leaf_module
+    else:
+        return None, None
+        
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a Masked Language Modeling task")
     parser.add_argument(
@@ -95,7 +123,6 @@ def parse_args():
         "--model_name_or_path",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
-        required=True,
     )
     parser.add_argument(
         "--config_name",
@@ -131,6 +158,12 @@ def parse_args():
         type=float,
         default=5e-5,
         help="Initial learning rate (after the potential warmup period) to use.",
+    )
+    parser.add_argument(
+        "--mask_loss_lambda",
+        type=float,
+        default=1e-4,
+        help="Initial learning rate of DAM",
     )
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
     parser.add_argument("--num_train_epochs", type=int, default=3, help="Total number of training epochs to perform.")
@@ -213,7 +246,6 @@ def parse_args():
         assert args.output_dir is not None, "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
 
     return args
-
 
 def main():
     args = parse_args()
@@ -467,6 +499,12 @@ def main():
         },
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    
+    # modify the internal structure of bert
+    dam_wrapper = DAMWrapper(tensor_size=[12, 512, 512], tau=1)
+    for name in ["bert.encoder.layer.{}.attention.self".format(i) for i in range(0, 12)]:
+        _, layer = get_module_by_name(model, name)
+        layer.dam_wrapper = dam_wrapper
 
     # Prepare everything with our `accelerator`.
     model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
@@ -494,6 +532,8 @@ def main():
         num_training_steps=args.max_train_steps,
     )
 
+    
+
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -512,7 +552,8 @@ def main():
         model.train()
         for step, batch in enumerate(train_dataloader):
             outputs = model(**batch)
-            loss = outputs.loss
+            mask_loss = args.mask_loss_lambda*torch.norm(dam_wrapper()[1], p=1)
+            loss = outputs.loss + mask_loss
             loss = loss / args.gradient_accumulation_steps
             accelerator.backward(loss)
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
